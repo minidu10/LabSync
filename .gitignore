@@ -1,0 +1,11 @@
+@"
+bin/
+*.class
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
+*.zip
+*.jks
+"@ | Set-Content -Encoding ascii .gitignore
