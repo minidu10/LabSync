@@ -18,9 +18,14 @@ import java.util.Queue;
 import java.util.Set;
 import java.util.TreeMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.Objects;
+import com.labsync.engine.BookingReceipt;
+import com.labsync.engine.BookingWorkerPool;
+import com.labsync.engine.SeatStore;
 
 /**
  * LabSync NIO Booking Gateway (TCP port 5000).
@@ -66,6 +71,7 @@ public final class NioGatewayServer implements Runnable {
 
     private final int port;
     private final FrameHandler handler;
+    private final BookingWorkerPool bookingPool;
     private final boolean debug = Boolean.getBoolean("labsync.debug");
 
     private final Queue<Runnable> reactorTasks = new ConcurrentLinkedQueue<>();
@@ -85,6 +91,24 @@ public final class NioGatewayServer implements Runnable {
     public NioGatewayServer(int port, FrameHandler handler) {
         this.port = port;
         this.handler = handler;
+        this.bookingPool = null;
+    }
+
+    public NioGatewayServer(int port, FrameHandler handler, BookingWorkerPool bookingPool) {
+        this.port = port;
+        this.handler = handler;
+        this.bookingPool = bookingPool;
+    }
+
+    public NioGatewayServer(int port, SeatStore seatStore,
+            BookingWorkerPool bookingPool) {
+        this.port = port;
+        this.bookingPool = Objects.requireNonNull(
+                bookingPool, "bookingPool must not be null");
+        this.handler = new EngineFrameHandler(
+                this,
+                Objects.requireNonNull(seatStore, "seatStore must not be null"),
+                bookingPool);
     }
 
     /** Binds port and starts the reactor on a dedicated thread named {@code LabSync-Reactor}. */
@@ -314,6 +338,9 @@ public final class NioGatewayServer implements Runnable {
         for (ClientSession s : new HashSet<>(sessions)) {
             s.close("server shutting down");
         }
+        if (bookingPool != null) {
+            bookingPool.shutdown();
+        }
         try {
             if (serverChannel != null) {
                 serverChannel.close();
@@ -328,6 +355,140 @@ public final class NioGatewayServer implements Runnable {
     static void log(String format, Object... args) {
         System.out.printf("%s [%s] %s%n", LocalTime.now().format(TIME),
                 Thread.currentThread().getName(), String.format(format, args));
+    }
+
+    // ------------------------------------------------------------------------- engine integration
+
+    /**
+     * Bridges the existing TCP protocol to Member 2's SeatStore and worker pool.
+     * Worker callbacks never send through sockets directly; they enqueue reactor
+     * tasks, which call {@link #wakeup()} before the reactor sends the response.
+     */
+    static final class EngineFrameHandler implements FrameHandler {
+        private final NioGatewayServer gateway;
+        private final SeatStore seatStore;
+        private final BookingWorkerPool workerPool;
+
+        EngineFrameHandler(NioGatewayServer gateway, SeatStore seatStore,
+                BookingWorkerPool workerPool) {
+            this.gateway = gateway;
+            this.seatStore = seatStore;
+            this.workerPool = workerPool;
+        }
+
+        @Override
+        public void onFrame(ClientSession session, String frame) {
+            String[] parts = frame.split("\\|", -1);
+            switch (parts[0]) {
+                case "LIST" -> handleList(session, parts);
+                case "BOOK" -> handleBook(session, parts);
+                default -> session.send("ERR|UNKNOWN_COMMAND");
+            }
+        }
+
+        private void handleList(ClientSession session, String[] parts) {
+            if (parts.length < 2) {
+                session.send("ERR|UNKNOWN_LAB");
+                return;
+            }
+            if (!isKnownLab(parts[1])) {
+                session.send("ERR|UNKNOWN_LAB");
+                return;
+            }
+
+            StringBuilder response =
+                    new StringBuilder("SLOTS|").append(parts[1]).append('|');
+            for (int seatId = 1; seatId <= 20; seatId++) {
+                if (seatId > 1) {
+                    response.append(',');
+                }
+                String seatName = String.format("S%02d", seatId);
+                response.append(seatName).append(':')
+                        .append(seatStore.isBooked(parts[1], seatId) ? "BOOKED" : "FREE");
+            }
+            session.send(response.toString());
+        }
+
+        private void handleBook(ClientSession session, String[] parts) {
+            if (parts.length < 5) {
+                session.send("BOOK_FAIL|BAD_FRAME");
+                return;
+            }
+
+            String labId = parts[1];
+            Integer seatId = parseSeatId(parts[2]);
+            if (!isKnownLab(labId)) {
+                session.send("BOOK_FAIL|UNKNOWN_SEAT");
+                return;
+            }
+            if (seatId == null) {
+                session.send("BOOK_FAIL|UNKNOWN_SEAT");
+                return;
+            }
+
+            String userId = parts[3];
+            if (userId.isBlank()) {
+                session.send("BOOK_FAIL|BAD_FRAME");
+                return;
+            }
+
+            try {
+                workerPool.submitBooking(
+                        seatStore,
+                        labId,
+                        seatId,
+                        userId,
+                        receipt -> gateway.execute(() -> sendBookingResult(session, receipt)),
+                        throwable -> gateway.execute(() -> {
+                            if (session.isOpen()) {
+                                session.send("ERR|INTERNAL");
+                            }
+                            NioGatewayServer.log(
+                                    "booking worker failed for session#%d: %s",
+                                    session.id(),
+                                    throwable);
+                        }));
+            } catch (RejectedExecutionException e) {
+                session.send("ERR|INTERNAL");
+            }
+        }
+
+        private void sendBookingResult(ClientSession session, BookingReceipt receipt) {
+            if (!session.isOpen()) {
+                return;
+            }
+            if (!receipt.isSuccessful()) {
+                String result = switch (receipt.getStatus()) {
+                    case SEAT_ALREADY_TAKEN -> "SEAT_ALREADY_TAKEN";
+                    case INVALID_REQUEST -> "UNKNOWN_SEAT";
+                    default -> "INTERNAL";
+                };
+                session.send("BOOK_FAIL|" + result);
+                return;
+            }
+
+            String receiptId = receipt.getReceiptId();
+            session.send("BOOK_OK|" + receiptId + "|UNSIGNED|labsync://localhost:"
+                    + DEFAULT_PORT + "/receipt/" + receiptId);
+        }
+
+        private static boolean isKnownLab(String labId) {
+            return "LAB_A".equals(labId) || "LAB_B".equals(labId);
+        }
+
+        private static Integer parseSeatId(String seatName) {
+            if (seatName == null
+                    || seatName.length() != 3
+                    || !seatName.startsWith("S")) {
+                return null;
+            }
+            try {
+                int seatId = Integer.parseInt(seatName.substring(1));
+                return seatId >= 1 && seatId <= 20 ? seatId : null;
+            } catch (NumberFormatException e) {
+                return null;
+            }
+        }
     }
 
     // ------------------------------------------------------------------------- standalone demo
@@ -391,7 +552,10 @@ public final class NioGatewayServer implements Runnable {
 
     public static void main(String[] args) throws Exception {
         int port = args.length > 0 ? Integer.parseInt(args[0]) : DEFAULT_PORT;
-        NioGatewayServer server = new NioGatewayServer(port, new DemoFrameHandler());
+        SeatStore seatStore = new SeatStore(Map.of("LAB_A", 20, "LAB_B", 20));
+        BookingWorkerPool workerPool = new BookingWorkerPool(4);
+        NioGatewayServer server =
+                new NioGatewayServer(port, seatStore, workerPool);
         Runtime.getRuntime().addShutdownHook(new Thread(server::stop, "LabSync-Shutdown"));
         server.start();
         server.awaitTermination();
