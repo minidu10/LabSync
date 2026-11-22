@@ -498,11 +498,20 @@ public final class NioGatewayServer implements Runnable {
      * It runs entirely on the reactor thread. At integration it is replaced by the engine's
      * SeatStore + worker pool (Member 2) and token checks (Member 4) via {@link FrameHandler}.
      */
-    static final class DemoFrameHandler implements FrameHandler {
+    static final class DemoFrameHandler implements FrameHandler, AutoCloseable {
         private final Map<String, Map<String, String>> labs = new TreeMap<>();
+        private final com.labsync.udp.UdpStatusBroadcaster broadcaster;
         private int receiptCounter;
 
         DemoFrameHandler() {
+            com.labsync.udp.UdpStatusBroadcaster b = null;
+            try {
+                b = new com.labsync.udp.UdpStatusBroadcaster();
+            } catch (Exception e) {
+                log("WARN Could not initialize UDP status broadcaster: %s", e.getMessage());
+            }
+            this.broadcaster = b;
+
             for (String lab : new String[] {"LAB_A", "LAB_B"}) {
                 Map<String, String> seats = new TreeMap<>();
                 for (int i = 1; i <= 20; i++) {
@@ -543,9 +552,26 @@ public final class NioGatewayServer implements Runnable {
                         String receiptId = String.format("R%05d", ++receiptCounter);
                         session.send("BOOK_OK|" + receiptId + "|UNSIGNED|labsync://localhost:" + DEFAULT_PORT
                                 + "/receipt/" + receiptId);
+
+                        // Broadcast live seat state transition over UDP Port 6000 (Member 3)
+                        if (broadcaster != null) {
+                            try {
+                                String user = parts.length > 3 && !parts[3].isBlank() ? parts[3] : "STUDENT";
+                                broadcaster.broadcast(parts[1], parts[2], "BOOKED", user);
+                            } catch (IOException e) {
+                                log("WARN UDP status broadcast failed: %s", e.getMessage());
+                            }
+                        }
                     }
                 }
                 default -> session.send("ERR|UNKNOWN_COMMAND");
+            }
+        }
+
+        @Override
+        public void close() {
+            if (broadcaster != null) {
+                broadcaster.close();
             }
         }
     }
