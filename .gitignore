@@ -1,4 +1,3 @@
-@"
 bin/
 *.class
 .idea/
@@ -8,4 +7,3 @@ bin/
 Thumbs.db
 *.zip
 *.jks
-"@ | Set-Content -Encoding ascii .gitignore
