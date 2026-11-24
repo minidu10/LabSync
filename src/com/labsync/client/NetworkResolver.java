@@ -13,13 +13,13 @@ import java.util.stream.Collectors;
  * 1. Turns a hostname typed by the user ("localhost", "lab-server.local")
  *    into an IP address using DNS / the hosts file (InetAddress.getByName).
  * 2. Parses receipt references of the form
- *    unibook://<host>:<port>/receipt/<receiptId> using java.net.URI.
+ *    labsync://<host>:<port>/receipt/<receiptId> using java.net.URI.
  *
  * No Swing code here - this class can be tested from the console.
  */
 public final class NetworkResolver {
 
-    public static final String RECEIPT_SCHEME = "unibook";
+    public static final String RECEIPT_SCHEME = "labsync";
 
     private NetworkResolver() { }
 
@@ -50,9 +50,9 @@ public final class NetworkResolver {
 
     /**
      * Parses and validates a receipt URI such as
-     * unibook://localhost:5000/receipt/R-1001.
+     * labsync://localhost:5000/receipt/R-1001.
      *
-     * @throws URISyntaxException if the text is not a valid unibook receipt URI
+     * @throws URISyntaxException if the text is not a valid labsync receipt URI
      */
     public static ReceiptUri parseReceiptUri(String text) throws URISyntaxException {
         URI uri = new URI(text.trim());

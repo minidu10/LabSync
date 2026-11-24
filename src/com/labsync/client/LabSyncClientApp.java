@@ -31,14 +31,16 @@ import javax.swing.JTextField;
 import javax.swing.SwingUtilities;
 import javax.swing.SwingWorker;
 import javax.swing.UIManager;
+import com.labsync.udp.UdpStatusListener;
 
 /**
- * UniBook desktop client (Member 5).
+ * LabSync desktop client (Member 5).
  *
  * Responsibilities are split so each class is easy to explain:
  *   NetworkResolver   - hostname -> IP, receipt URI parsing
  *   AuthClient        - TLS login on 8443
- *   GatewayConnection - LIST / BOOK over TCP on 5000
+ *   GatewayConnection - LIST / BOOK / CANCEL over TCP on 5000
+ *   UdpStatusListener - live seat updates on UDP 6000 (Member 3)
  *   SeatGridPanel     - drawing seats (no networking)
  *   this class        - wiring + threading + error messages
  *
@@ -47,7 +49,7 @@ import javax.swing.UIManager;
  * the Event Dispatch Thread, which is the only thread that updates components.
  * So a slow or dead server can never freeze the window.
  */
-public class UniBookClientApp extends JFrame {
+public class LabSyncClientApp extends JFrame {
 
     private static final long serialVersionUID = 1L;
 
@@ -68,6 +70,7 @@ public class UniBookClientApp extends JFrame {
 
     // ---- networking objects (no Swing inside) ----
     private final GatewayConnection gateway = new GatewayConnection();
+    private final UdpStatusListener liveFeed = new UdpStatusListener(UdpStatusListener.DEFAULT_PORT);
     private volatile Session session;
     private volatile String host;
 
@@ -91,8 +94,8 @@ public class UniBookClientApp extends JFrame {
     private final SeatGridPanel grid = new SeatGridPanel();
     private final JTextArea logArea = new JTextArea(8, 60);
 
-    public UniBookClientApp(String initialHost) {
-        super("UniBook - Seat & Lab-Slot Booking");
+    public LabSyncClientApp(String initialHost) {
+        super("LabSync - Seat & Lab-Slot Booking");
         hostField.setText(initialHost);
         buildLayout();
         wireEvents();
@@ -107,6 +110,26 @@ public class UniBookClientApp extends JFrame {
     /** The UDP listener (Member 3) delivers updates to this handler. */
     public SeatUpdateHandler getSeatUpdateHandler() {
         return grid;
+    }
+
+    /**
+     * Starts listening for live seat updates on UDP port 6000. The listener drops stale packets
+     * (incomingSeq <= lastSeenSeq) and calls us on its own thread; SeatGridPanel moves the
+     * change onto the EDT. If the port cannot be opened the app still works - the keep-alive
+     * LIST refreshes the grid every few seconds.
+     */
+    private void startLiveFeed() {
+        liveFeed.addStatusListener(u -> {
+            log("UDP  SEQ:" + u.sequenceNumber() + " " + u.labId() + " " + u.seatId()
+                    + " -> " + u.status() + " by " + u.userId());
+            grid.onSeatUpdate(u.labId(), u.seatId(), u.status(), u.userId());
+        });
+        try {
+            liveFeed.start();
+            log("UDP  listening for live seat updates on port " + liveFeed.getPort());
+        } catch (java.net.SocketException e) {
+            log("UDP  live feed unavailable (" + e.getMessage() + ") - using periodic refresh only");
+        }
     }
 
     // =====================================================================
@@ -124,7 +147,7 @@ public class UniBookClientApp extends JFrame {
      */
     private void buildLayout() {
         // --- header ---
-        JLabel appName = new JLabel("UniBook");
+        JLabel appName = new JLabel("LabSync");
         appName.setFont(appName.getFont().deriveFont(Font.BOLD, 22f));
         appName.setForeground(Color.WHITE);
         JLabel subtitle = new JLabel("  Seat & Lab-Slot Booking");
@@ -211,7 +234,16 @@ public class UniBookClientApp extends JFrame {
                 refresh();
             }
         });
-        grid.setOnSeatClicked(this::bookSeat);
+        grid.setOnSeatClicked(this::onSeatClicked);
+    }
+
+    /** A FREE seat is booked; a booked seat we may cancel (ours, or any for ADMIN) is cancelled. */
+    private void onSeatClicked(String seatId) {
+        if ("FREE".equals(grid.getStatus(seatId))) {
+            bookSeat(seatId);
+        } else {
+            cancelSeat(seatId);
+        }
     }
 
     // =====================================================================
@@ -249,6 +281,7 @@ public class UniBookClientApp extends JFrame {
             gateway.connect(address, GatewayConnection.DEFAULT_PORT);
             log("TCP  connected to gateway " + address.getHostAddress() + ":" + GatewayConnection.DEFAULT_PORT);
 
+            liveFeed.resetSequence();       // the gateway may have restarted and count from SEQ:1
             Map<String, String> seats = gateway.listSeats(lab);
             host = hostText;
             session = login.session();
@@ -259,6 +292,7 @@ public class UniBookClientApp extends JFrame {
             userLabel.setText("● " + session.userId() + "  ·  " + session.role());
             userLabel.setForeground(session.isAdmin() ? new Color(142, 36, 170) : SeatGridPanel.MINE);
             grid.setCurrentUser(session.userId());
+            grid.setCanCancelAny(session.isAdmin());
             showSeats(lab, seats);
         });
     }
@@ -289,6 +323,29 @@ public class UniBookClientApp extends JFrame {
                 JOptionPane.showMessageDialog(this, "Booking failed: " + result.reason(),
                         "Booking failed", JOptionPane.WARNING_MESSAGE);
                 refresh();   // our map was stale - reload it
+            }
+        });
+    }
+
+    /** Called when the user clicks their own booked seat (or any booked seat, as ADMIN). */
+    private void cancelSeat(String seatId) {
+        String lab = grid.getCurrentLab();
+        int answer = JOptionPane.showConfirmDialog(this,
+                "Cancel the booking for seat " + seatId + " in " + lab + "?", "Cancel booking",
+                JOptionPane.YES_NO_OPTION);
+        if (answer != JOptionPane.YES_OPTION) {
+            return;
+        }
+        log("CANCEL " + lab + " " + seatId + " ...");
+        runInBackground(() -> gateway.cancel(lab, seatId, session), result -> {
+            if (result.ok()) {
+                grid.setSeatStatus(seatId, "FREE");
+                log("CANCEL_OK " + lab + " " + seatId);
+            } else {
+                log("CANCEL_FAIL " + result.reason());
+                JOptionPane.showMessageDialog(this, "Cancel failed: " + result.reason(),
+                        "Cancel failed", JOptionPane.WARNING_MESSAGE);
+                refresh();
             }
         });
     }
@@ -365,7 +422,7 @@ public class UniBookClientApp extends JFrame {
         if (!gateway.isConnected()) {
             onConnectionLost();
         }
-        JOptionPane.showMessageDialog(this, message, "UniBook", JOptionPane.ERROR_MESSAGE);
+        JOptionPane.showMessageDialog(this, message, "LabSync", JOptionPane.ERROR_MESSAGE);
     }
 
     private static boolean hasCause(Throwable t, Class<? extends Throwable> type) {
@@ -457,6 +514,7 @@ public class UniBookClientApp extends JFrame {
                 try {
                     Thread.sleep(delay);
                     gateway.connect(NetworkResolver.resolve(targetHost), GatewayConnection.DEFAULT_PORT);
+                    liveFeed.resetSequence();        // a restarted gateway counts from SEQ:1 again
                     Map<String, String> seats = gateway.listSeats(lab);
                     SwingUtilities.invokeLater(() -> {
                         if (reconnectThread != me) {
@@ -508,7 +566,7 @@ public class UniBookClientApp extends JFrame {
     /**
      * Run with the truststore that trusts the auth server's certificate:
      *   java -Djavax.net.ssl.trustStore=... -Djavax.net.ssl.trustStorePassword=...
-     *        -cp bin com.labsync.client.UniBookClientApp [host]
+     *        -cp bin com.labsync.client.LabSyncClientApp [host]
      */
     /** Nimbus ships with the JDK (javax.swing) - a modern look with no extra library. */
     private static void useNimbusLookAndFeel() {
@@ -529,10 +587,9 @@ public class UniBookClientApp extends JFrame {
         String initialHost = args.length > 0 ? args[0] : "localhost";
         SwingUtilities.invokeLater(() -> {
             useNimbusLookAndFeel();
-            UniBookClientApp app = new UniBookClientApp(initialHost);
+            LabSyncClientApp app = new LabSyncClientApp(initialHost);
             app.setVisible(true);
-            // Integration point (Member 3): start the UDP listener here, e.g.
-            //   new UdpStatusListener(6000, app.getSeatUpdateHandler()).start();
+            app.startLiveFeed();            // Member 3: live seat updates on UDP 6000
         });
     }
 }

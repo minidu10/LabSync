@@ -13,6 +13,8 @@ import java.util.Map;
  *   LIST|<labId>                               -> SLOTS|<labId>|S01:FREE,S02:BOOKED,...
  *   BOOK|<labId>|<seatId>|<TOKEN>|<SIG>        -> BOOK_OK|<receiptId>|<hash>|<uri>
  *                                                 BOOK_FAIL|<reason>
+ *   CANCEL|<labId>|<seatId>|<TOKEN>|<SIG>      -> CANCEL_OK|<labId>|<seatId>
+ *                                                 CANCEL_FAIL|<reason>
  *
  * Every frame is one UTF-8 line ending in '\n' (the '\n' is added by the
  * connection classes, not here).
@@ -35,6 +37,11 @@ public final class Protocol {
 
     public static String book(String labId, String seatId, Session s) {
         return "BOOK" + SEP + clean(labId) + SEP + clean(seatId)
+                + SEP + s.token() + SEP + s.signature();
+    }
+
+    public static String cancel(String labId, String seatId, Session s) {
+        return "CANCEL" + SEP + clean(labId) + SEP + clean(seatId)
                 + SEP + s.token() + SEP + s.signature();
     }
 
@@ -97,6 +104,20 @@ public final class Protocol {
             return BookResult.failure(p[0] + ": " + p[1]);
         }
         throw new ProtocolException("Unexpected reply to BOOK: " + line);
+    }
+
+    /** Result of a CANCEL request: ok, or a failure reason. */
+    public record CancelResult(boolean ok, String reason) { }
+
+    public static CancelResult parseCancel(String line) throws ProtocolException {
+        String[] p = split(line);
+        if (p[0].equals("CANCEL_OK")) {
+            return new CancelResult(true, null);
+        }
+        if (p.length >= 2 && (p[0].endsWith("FAIL") || p[0].startsWith("ERR"))) {
+            return new CancelResult(false, p[0].equals("CANCEL_FAIL") ? p[1] : p[0] + ": " + p[1]);
+        }
+        throw new ProtocolException("Unexpected reply to CANCEL: " + line);
     }
 
     /**
