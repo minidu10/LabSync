@@ -16,6 +16,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -31,18 +32,27 @@ public final class NioGatewayIntegrationTest {
     private static final TokenService TOKENS = new TokenService(
             SharedSecret.of("integration-test-secret-0123".getBytes(StandardCharsets.UTF_8)));
 
+    /** Every seat change the gateway announces on the live feed, in order. */
+    private static final List<String> PUBLISHED = new CopyOnWriteArrayList<>();
+
     /** BOOK|lab|seat|TOKEN|SIG for a STUDENT token issued to {@code userId}. */
     private static String book(String labId, String seatId, String userId) {
         TokenService.IssuedToken t = TOKENS.issue(userId, RoleGuard.Role.STUDENT);
         return "BOOK|" + labId + "|" + seatId + "|" + t.token() + "|" + t.signature();
     }
 
+    /** CANCEL|lab|seat|TOKEN|SIG for a token issued to {@code userId} with {@code role}. */
+    private static String cancel(String labId, String seatId, String userId, RoleGuard.Role role) {
+        TokenService.IssuedToken t = TOKENS.issue(userId, role);
+        return "CANCEL|" + labId + "|" + seatId + "|" + t.token() + "|" + t.signature();
+    }
+
     public static void main(String[] args) throws Exception {
         int port = findFreePort();
         SeatStore seatStore = new SeatStore(Map.of("LAB_A", 20, "LAB_B", 20));
         BookingWorkerPool workerPool = new BookingWorkerPool(4);
-        NioGatewayServer server =
-                new NioGatewayServer(port, seatStore, workerPool, new RoleGuard(TOKENS));
+        NioGatewayServer server = new NioGatewayServer(port, seatStore, workerPool, new RoleGuard(TOKENS),
+                (labId, seatId, status, userId) -> PUBLISHED.add(labId + "|" + seatId + "|" + status + "|" + userId));
 
         try {
             testServerStarts(server, port);
@@ -51,6 +61,8 @@ public final class NioGatewayIntegrationTest {
             testSameSeatRace(server, port);
             testSelectorResponsive(server, port);
             testDifferentSeats(server, port);
+            testCancel(port);
+            testLiveFeedPublishing(port);
         } finally {
             testGracefulShutdown(server, workerPool);
         }
@@ -259,6 +271,47 @@ public final class NioGatewayIntegrationTest {
                         && second.get().startsWith("BOOK_OK|")
                         && third.get().startsWith("BOOK_OK|"),
                 "all three clients receive BOOK_OK");
+    }
+
+    private static void testCancel(int port) throws Exception {
+        exchange(port, book("LAB_B", "S01", "owner"));
+        exchange(port, book("LAB_B", "S02", "owner"));
+
+        String stranger = exchange(port, cancel("LAB_B", "S01", "stranger", RoleGuard.Role.STUDENT));
+        String freeSeat = exchange(port, cancel("LAB_B", "S03", "owner", RoleGuard.Role.STUDENT));
+        String own = exchange(port, cancel("LAB_B", "S01", "owner", RoleGuard.Role.STUDENT));
+        String admin = exchange(port, cancel("LAB_B", "S02", "admin", RoleGuard.Role.ADMIN));
+        String slots = exchange(port, "LIST|LAB_B");
+
+        check("9. CANCEL: stranger NOT_OWNER, free seat NOT_BOOKED, owner and ADMIN succeed",
+                "CANCEL_FAIL|NOT_OWNER".equals(stranger)
+                        && "CANCEL_FAIL|NOT_BOOKED".equals(freeSeat)
+                        && "CANCEL_OK|LAB_B|S01".equals(own)
+                        && "CANCEL_OK|LAB_B|S02".equals(admin)
+                        && slots.contains("S01:FREE") && slots.contains("S02:FREE"),
+                "stranger=" + stranger + ", free=" + freeSeat + ", own=" + own + ", admin=" + admin);
+
+        TokenService.IssuedToken t = TOKENS.issue("owner", RoleGuard.Role.STUDENT);
+        String tampered = exchange(port, "CANCEL|LAB_B|S01|" + t.token() + "|0" + t.signature().substring(1));
+        check("10. CANCEL with a tampered signature is rejected",
+                "CANCEL_FAIL|INVALID_SIGNATURE".equals(tampered),
+                "CANCEL_FAIL|INVALID_SIGNATURE, got " + tampered);
+    }
+
+    private static void testLiveFeedPublishing(int port) throws Exception {
+        PUBLISHED.clear();
+        String ok = exchange(port, book("LAB_B", "S20", "feed-user"));
+        String taken = exchange(port, book("LAB_B", "S20", "other-user"));
+        String cancelled = exchange(port, cancel("LAB_B", "S20", "feed-user", RoleGuard.Role.STUDENT));
+
+        check("11. Live feed: BOOK publishes BOOKED, CANCEL publishes FREE, failed BOOK publishes nothing",
+                ok.startsWith("BOOK_OK|")
+                        && "BOOK_FAIL|SEAT_ALREADY_TAKEN".equals(taken)
+                        && "CANCEL_OK|LAB_B|S20".equals(cancelled)
+                        && PUBLISHED.equals(List.of(
+                                "LAB_B|S20|BOOKED|feed-user",
+                                "LAB_B|S20|FREE|feed-user")),
+                "[LAB_B|S20|BOOKED|feed-user, LAB_B|S20|FREE|feed-user], got " + PUBLISHED);
     }
 
     private static void testGracefulShutdown(NioGatewayServer server,

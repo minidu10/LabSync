@@ -16,7 +16,6 @@ import java.util.Iterator;
 import java.util.Map;
 import java.util.Queue;
 import java.util.Set;
-import java.util.TreeMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -29,6 +28,7 @@ import com.labsync.engine.SeatStore;
 import com.labsync.security.AuthorizationException;
 import com.labsync.security.RoleGuard;
 import com.labsync.security.TokenService;
+import com.labsync.udp.UdpStatusBroadcaster;
 
 /**
  * LabSync NIO Booking Gateway (TCP port 5000).
@@ -70,6 +70,18 @@ public final class NioGatewayServer implements Runnable {
     @FunctionalInterface
     public interface FrameHandler {
         void onFrame(ClientSession session, String frame);
+    }
+
+    /**
+     * Integration point for the UDP live feed (Member 3). Called on a booking worker thread -
+     * never on the reactor thread - after a seat changes state. {@code main} plugs in a
+     * {@link UdpStatusBroadcaster}; tests can plug in an in-memory recorder.
+     */
+    @FunctionalInterface
+    public interface SeatStatusPublisher {
+        SeatStatusPublisher NONE = (labId, seatId, status, userId) -> { };
+
+        void publish(String labId, String seatId, String status, String userId) throws IOException;
     }
 
     private final int port;
@@ -115,6 +127,15 @@ public final class NioGatewayServer implements Runnable {
     /** Engine-backed gateway with an explicit {@link RoleGuard} (Member 4) for token checks. */
     public NioGatewayServer(int port, SeatStore seatStore,
             BookingWorkerPool bookingPool, RoleGuard roleGuard) {
+        this(port, seatStore, bookingPool, roleGuard, SeatStatusPublisher.NONE);
+    }
+
+    /**
+     * Fully integrated gateway: engine (Member 2), security (Member 4) and a publisher that
+     * announces every seat change on the UDP live feed (Member 3).
+     */
+    public NioGatewayServer(int port, SeatStore seatStore, BookingWorkerPool bookingPool,
+            RoleGuard roleGuard, SeatStatusPublisher publisher) {
         this.port = port;
         this.bookingPool = Objects.requireNonNull(
                 bookingPool, "bookingPool must not be null");
@@ -122,7 +143,8 @@ public final class NioGatewayServer implements Runnable {
                 this,
                 Objects.requireNonNull(seatStore, "seatStore must not be null"),
                 bookingPool,
-                Objects.requireNonNull(roleGuard, "roleGuard must not be null"));
+                Objects.requireNonNull(roleGuard, "roleGuard must not be null"),
+                Objects.requireNonNull(publisher, "publisher must not be null"));
     }
 
     /** Binds port and starts the reactor on a dedicated thread named {@code LabSync-Reactor}. */
@@ -378,10 +400,15 @@ public final class NioGatewayServer implements Runnable {
      * Worker callbacks never send through sockets directly; they enqueue reactor
      * tasks, which call {@link #wakeup()} before the reactor sends the response.
      *
-     * <p>Security (Member 4): BOOK and ADD_LAB carry {@code <TOKEN>|<SIG>} issued by TlsAuthServer.
-     * {@link RoleGuard#authorize} verifies the HMAC-SHA256 signature, decrypts the AES token,
-     * checks expiry and role. The acting user comes from the verified token, never from the frame.
-     * This costs one HMAC plus one AES-GCM decrypt (microseconds), so it stays on the reactor thread.
+     * <p>Security (Member 4): BOOK, CANCEL and ADD_LAB carry {@code <TOKEN>|<SIG>} issued by
+     * TlsAuthServer. {@link RoleGuard#authorize} verifies the HMAC-SHA256 signature, decrypts the
+     * AES token, checks expiry and role. The acting user comes from the verified token, never from
+     * the frame. This costs one HMAC plus one AES-GCM decrypt (microseconds), so it stays on the
+     * reactor thread.
+     *
+     * <p>Live feed (Member 3): after a successful BOOK or CANCEL the worker thread publishes the
+     * new seat state through the {@link SeatStatusPublisher} (UDP port 6000), so the reactor
+     * thread never does that I/O.
      */
     static final class EngineFrameHandler implements FrameHandler {
         /** Seats per lab; LIST and seat parsing already assume this fixed layout. */
@@ -391,13 +418,15 @@ public final class NioGatewayServer implements Runnable {
         private final SeatStore seatStore;
         private final BookingWorkerPool workerPool;
         private final RoleGuard roleGuard;
+        private final SeatStatusPublisher publisher;
 
         EngineFrameHandler(NioGatewayServer gateway, SeatStore seatStore,
-                BookingWorkerPool workerPool, RoleGuard roleGuard) {
+                BookingWorkerPool workerPool, RoleGuard roleGuard, SeatStatusPublisher publisher) {
             this.gateway = gateway;
             this.seatStore = seatStore;
             this.workerPool = workerPool;
             this.roleGuard = roleGuard;
+            this.publisher = publisher;
         }
 
         @Override
@@ -406,8 +435,19 @@ public final class NioGatewayServer implements Runnable {
             switch (parts[0]) {
                 case "LIST" -> handleList(session, parts);
                 case "BOOK" -> handleBook(session, parts);
+                case "CANCEL" -> handleCancel(session, parts);
                 case "ADD_LAB" -> handleAddLab(session, parts);
                 default -> session.send("ERR|UNKNOWN_COMMAND");
+            }
+        }
+
+        /** Announces a seat change on the live feed. Runs on a worker thread; never throws. */
+        private void publish(String labId, String seatId, String status, String userId) {
+            try {
+                publisher.publish(labId, seatId, status, userId);
+            } catch (IOException | RuntimeException e) {
+                NioGatewayServer.log("WARN live-feed publish failed for %s %s -> %s: %s",
+                        labId, seatId, status, e.getMessage());
             }
         }
 
@@ -501,6 +541,7 @@ public final class NioGatewayServer implements Runnable {
             }
 
             String userId = claims.userId(); // from the verified token, not from the frame
+            String seatName = parts[2];
 
             try {
                 workerPool.submitBooking(
@@ -508,7 +549,12 @@ public final class NioGatewayServer implements Runnable {
                         labId,
                         seatId,
                         userId,
-                        receipt -> gateway.execute(() -> sendBookingResult(session, receipt)),
+                        receipt -> {
+                            if (receipt.isSuccessful()) {
+                                publish(labId, seatName, "BOOKED", userId); // still on the worker
+                            }
+                            gateway.execute(() -> sendBookingResult(session, receipt));
+                        },
                         throwable -> gateway.execute(() -> {
                             if (session.isOpen()) {
                                 session.send("ERR|INTERNAL");
@@ -544,6 +590,65 @@ public final class NioGatewayServer implements Runnable {
                     + DEFAULT_PORT + "/receipt/" + receiptId);
         }
 
+        /**
+         * CANCEL|&lt;labId&gt;|&lt;seatId&gt;|&lt;TOKEN&gt;|&lt;SIG&gt;. A STUDENT may cancel only
+         * their own booking; an ADMIN may cancel any booking.
+         * Replies {@code CANCEL_OK|<labId>|<seatId>} or {@code CANCEL_FAIL|<reason>}.
+         */
+        private void handleCancel(ClientSession session, String[] parts) {
+            if (parts.length != 5) {
+                session.send("CANCEL_FAIL|BAD_FRAME");
+                return;
+            }
+            TokenService.Claims claims =
+                    authorize(session, RoleGuard.Action.CANCEL, parts[3], parts[4], "CANCEL_FAIL");
+            if (claims == null) {
+                return;
+            }
+            String labId = parts[1];
+            String seatName = parts[2];
+            Integer seatId = parseSeatId(seatName);
+            if (!isKnownLab(labId) || seatId == null) {
+                session.send("CANCEL_FAIL|UNKNOWN_SEAT");
+                return;
+            }
+            String userId = claims.userId();
+            boolean admin = claims.role() == RoleGuard.Role.ADMIN;
+
+            try {
+                workerPool.submitAsync(
+                        () -> seatStore.cancelSeat(labId, seatId, userId, admin),
+                        outcome -> {
+                            if (outcome == SeatStore.CancelOutcome.CANCELLED) {
+                                publish(labId, seatName, "FREE", userId);
+                            }
+                            gateway.execute(() -> sendCancelResult(session, labId, seatName, userId, outcome));
+                        },
+                        throwable -> gateway.execute(() -> {
+                            if (session.isOpen()) {
+                                session.send("ERR|INTERNAL");
+                            }
+                            NioGatewayServer.log("cancel worker failed for session#%d: %s",
+                                    session.id(), throwable);
+                        }));
+            } catch (RejectedExecutionException e) {
+                session.send("ERR|INTERNAL");
+            }
+        }
+
+        private void sendCancelResult(ClientSession session, String labId, String seatName,
+                String userId, SeatStore.CancelOutcome outcome) {
+            if (!session.isOpen()) {
+                return;
+            }
+            if (outcome == SeatStore.CancelOutcome.CANCELLED) {
+                NioGatewayServer.log("session#%d %s %s cancelled by %s", session.id(), labId, seatName, userId);
+                session.send("CANCEL_OK|" + labId + "|" + seatName);
+            } else {
+                session.send("CANCEL_FAIL|" + outcome);
+            }
+        }
+
         private boolean isKnownLab(String labId) {
             return seatStore.getLabIds().contains(labId); // includes labs added with ADD_LAB
         }
@@ -563,98 +668,35 @@ public final class NioGatewayServer implements Runnable {
         }
     }
 
-    // ------------------------------------------------------------------------- standalone demo
+    // ------------------------------------------------------------------------------------ main
 
     /**
-     * Minimal in-memory LIST/BOOK handler so the gateway can be run and demonstrated on its own.
-     * It runs entirely on the reactor thread. At integration it is replaced by the engine's
-     * SeatStore + worker pool (Member 2) and token checks (Member 4) via {@link FrameHandler}.
+     * Starts the fully integrated gateway: SeatStore + worker pool (Member 2), token checks with
+     * the shared secret (Member 4) and the UDP live feed on port 6000 (Member 3).
      */
-    static final class DemoFrameHandler implements FrameHandler, AutoCloseable {
-        private final Map<String, Map<String, String>> labs = new TreeMap<>();
-        private final com.labsync.udp.UdpStatusBroadcaster broadcaster;
-        private int receiptCounter;
-
-        DemoFrameHandler() {
-            com.labsync.udp.UdpStatusBroadcaster b = null;
-            try {
-                b = new com.labsync.udp.UdpStatusBroadcaster();
-            } catch (Exception e) {
-                log("WARN Could not initialize UDP status broadcaster: %s", e.getMessage());
-            }
-            this.broadcaster = b;
-
-            for (String lab : new String[] {"LAB_A", "LAB_B"}) {
-                Map<String, String> seats = new TreeMap<>();
-                for (int i = 1; i <= 20; i++) {
-                    seats.put(String.format("S%02d", i), "FREE");
-                }
-                labs.put(lab, seats);
-            }
-        }
-
-        @Override
-        public void onFrame(ClientSession session, String frame) {
-            String[] parts = frame.split("\\|", -1);
-            switch (parts[0]) {
-                case "LIST" -> {
-                    Map<String, String> seats = parts.length >= 2 ? labs.get(parts[1]) : null;
-                    if (seats == null) {
-                        session.send("ERR|UNKNOWN_LAB");
-                        return;
-                    }
-                    StringBuilder sb = new StringBuilder("SLOTS|").append(parts[1]).append('|');
-                    seats.forEach((seat, status) -> sb.append(seat).append(':').append(status).append(','));
-                    sb.setLength(sb.length() - 1);
-                    session.send(sb.toString());
-                }
-                case "BOOK" -> {
-                    if (parts.length < 5) {
-                        session.send("BOOK_FAIL|BAD_FRAME");
-                        return;
-                    }
-                    Map<String, String> seats = labs.get(parts[1]);
-                    String status = seats == null ? null : seats.get(parts[2]);
-                    if (status == null) {
-                        session.send("BOOK_FAIL|UNKNOWN_SEAT");
-                    } else if (!status.equals("FREE")) {
-                        session.send("BOOK_FAIL|SEAT_ALREADY_TAKEN");
-                    } else {
-                        seats.put(parts[2], "BOOKED");
-                        String receiptId = String.format("R%05d", ++receiptCounter);
-                        session.send("BOOK_OK|" + receiptId + "|UNSIGNED|labsync://localhost:" + DEFAULT_PORT
-                                + "/receipt/" + receiptId);
-
-                        // Broadcast live seat state transition over UDP Port 6000 (Member 3)
-                        if (broadcaster != null) {
-                            try {
-                                String user = parts.length > 3 && !parts[3].isBlank() ? parts[3] : "STUDENT";
-                                broadcaster.broadcast(parts[1], parts[2], "BOOKED", user);
-                            } catch (IOException e) {
-                                log("WARN UDP status broadcast failed: %s", e.getMessage());
-                            }
-                        }
-                    }
-                }
-                default -> session.send("ERR|UNKNOWN_COMMAND");
-            }
-        }
-
-        @Override
-        public void close() {
-            if (broadcaster != null) {
-                broadcaster.close();
-            }
-        }
-    }
-
     public static void main(String[] args) throws Exception {
         int port = args.length > 0 ? Integer.parseInt(args[0]) : DEFAULT_PORT;
         SeatStore seatStore = new SeatStore(Map.of("LAB_A", 20, "LAB_B", 20));
         BookingWorkerPool workerPool = new BookingWorkerPool(4);
-        NioGatewayServer server =
-                new NioGatewayServer(port, seatStore, workerPool);
-        Runtime.getRuntime().addShutdownHook(new Thread(server::stop, "LabSync-Shutdown"));
+
+        UdpStatusBroadcaster broadcaster = null;
+        SeatStatusPublisher publisher = SeatStatusPublisher.NONE;
+        try {
+            broadcaster = new UdpStatusBroadcaster(UdpStatusBroadcaster.DEFAULT_PORT);
+            publisher = broadcaster::broadcast;
+        } catch (IOException e) {
+            log("WARN UDP live feed disabled - could not open broadcast socket: %s", e.getMessage());
+        }
+
+        NioGatewayServer server = new NioGatewayServer(port, seatStore, workerPool,
+                new RoleGuard(TokenService.fromEnvironment()), publisher);
+        UdpStatusBroadcaster feed = broadcaster;
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            server.stop();
+            if (feed != null) {
+                feed.close();
+            }
+        }, "LabSync-Shutdown"));
         server.start();
         server.awaitTermination();
     }
