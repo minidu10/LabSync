@@ -7,3 +7,5 @@ bin/
 Thumbs.db
 *.zip
 *.jks
+# shared token secret created by TlsAuthServer / NioGatewayServer - never commit
+labsync.secret

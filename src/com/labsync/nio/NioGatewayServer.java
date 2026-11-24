@@ -26,6 +26,9 @@ import java.util.Objects;
 import com.labsync.engine.BookingReceipt;
 import com.labsync.engine.BookingWorkerPool;
 import com.labsync.engine.SeatStore;
+import com.labsync.security.AuthorizationException;
+import com.labsync.security.RoleGuard;
+import com.labsync.security.TokenService;
 
 /**
  * LabSync NIO Booking Gateway (TCP port 5000).
@@ -100,15 +103,26 @@ public final class NioGatewayServer implements Runnable {
         this.bookingPool = bookingPool;
     }
 
+    /**
+     * Engine-backed gateway secured with the shared secret from the environment
+     * (see {@link com.labsync.security.SharedSecret}), so it accepts tokens from TlsAuthServer.
+     */
     public NioGatewayServer(int port, SeatStore seatStore,
             BookingWorkerPool bookingPool) {
+        this(port, seatStore, bookingPool, new RoleGuard(TokenService.fromEnvironment()));
+    }
+
+    /** Engine-backed gateway with an explicit {@link RoleGuard} (Member 4) for token checks. */
+    public NioGatewayServer(int port, SeatStore seatStore,
+            BookingWorkerPool bookingPool, RoleGuard roleGuard) {
         this.port = port;
         this.bookingPool = Objects.requireNonNull(
                 bookingPool, "bookingPool must not be null");
         this.handler = new EngineFrameHandler(
                 this,
                 Objects.requireNonNull(seatStore, "seatStore must not be null"),
-                bookingPool);
+                bookingPool,
+                Objects.requireNonNull(roleGuard, "roleGuard must not be null"));
     }
 
     /** Binds port and starts the reactor on a dedicated thread named {@code LabSync-Reactor}. */
@@ -363,17 +377,27 @@ public final class NioGatewayServer implements Runnable {
      * Bridges the existing TCP protocol to Member 2's SeatStore and worker pool.
      * Worker callbacks never send through sockets directly; they enqueue reactor
      * tasks, which call {@link #wakeup()} before the reactor sends the response.
+     *
+     * <p>Security (Member 4): BOOK and ADD_LAB carry {@code <TOKEN>|<SIG>} issued by TlsAuthServer.
+     * {@link RoleGuard#authorize} verifies the HMAC-SHA256 signature, decrypts the AES token,
+     * checks expiry and role. The acting user comes from the verified token, never from the frame.
+     * This costs one HMAC plus one AES-GCM decrypt (microseconds), so it stays on the reactor thread.
      */
     static final class EngineFrameHandler implements FrameHandler {
+        /** Seats per lab; LIST and seat parsing already assume this fixed layout. */
+        static final int SEATS_PER_LAB = 20;
+
         private final NioGatewayServer gateway;
         private final SeatStore seatStore;
         private final BookingWorkerPool workerPool;
+        private final RoleGuard roleGuard;
 
         EngineFrameHandler(NioGatewayServer gateway, SeatStore seatStore,
-                BookingWorkerPool workerPool) {
+                BookingWorkerPool workerPool, RoleGuard roleGuard) {
             this.gateway = gateway;
             this.seatStore = seatStore;
             this.workerPool = workerPool;
+            this.roleGuard = roleGuard;
         }
 
         @Override
@@ -382,8 +406,52 @@ public final class NioGatewayServer implements Runnable {
             switch (parts[0]) {
                 case "LIST" -> handleList(session, parts);
                 case "BOOK" -> handleBook(session, parts);
+                case "ADD_LAB" -> handleAddLab(session, parts);
                 default -> session.send("ERR|UNKNOWN_COMMAND");
             }
+        }
+
+        /**
+         * Runs the RoleGuard check; on failure logs it, sends {@code <failPrefix>|<REASON>} and
+         * returns {@code null}.
+         */
+        private TokenService.Claims authorize(ClientSession session, RoleGuard.Action action,
+                String token, String signature, String failPrefix) {
+            try {
+                TokenService.Claims claims = roleGuard.authorize(action, token, signature);
+                NioGatewayServer.log("session#%d SECURITY %s authorized: user=%s role=%s (signature OK, token valid until %s)",
+                        session.id(), action, claims.userId(), claims.role(), claims.expiresAt());
+                return claims;
+            } catch (AuthorizationException e) {
+                NioGatewayServer.log("session#%d SECURITY %s REJECTED -> %s: %s",
+                        session.id(), action, e.reason(), e.getMessage());
+                session.send(failPrefix + "|" + e.reason());
+                return null;
+            }
+        }
+
+        /** ADD_LAB|&lt;labId&gt;|&lt;TOKEN&gt;|&lt;SIG&gt; - ADMIN only; creates a 20-seat lab. */
+        private void handleAddLab(ClientSession session, String[] parts) {
+            if (parts.length != 4) {
+                session.send("ADD_LAB_FAIL|BAD_FRAME");
+                return;
+            }
+            if (authorize(session, RoleGuard.Action.ADD_LAB, parts[2], parts[3], "ADD_LAB_FAIL") == null) {
+                return;
+            }
+            String labId = parts[1];
+            if (!labId.matches("[A-Z0-9_]{1,16}")) {
+                session.send("ADD_LAB_FAIL|INVALID_LAB_ID");
+                return;
+            }
+            try {
+                seatStore.addLab(labId, SEATS_PER_LAB);
+            } catch (IllegalArgumentException e) {
+                session.send("ADD_LAB_FAIL|LAB_EXISTS");
+                return;
+            }
+            NioGatewayServer.log("session#%d lab %s created with %d seats", session.id(), labId, SEATS_PER_LAB);
+            session.send("ADD_LAB_OK|" + labId + "|" + SEATS_PER_LAB);
         }
 
         private void handleList(ClientSession session, String[] parts) {
@@ -398,7 +466,7 @@ public final class NioGatewayServer implements Runnable {
 
             StringBuilder response =
                     new StringBuilder("SLOTS|").append(parts[1]).append('|');
-            for (int seatId = 1; seatId <= 20; seatId++) {
+            for (int seatId = 1; seatId <= SEATS_PER_LAB; seatId++) {
                 if (seatId > 1) {
                     response.append(',');
                 }
@@ -409,9 +477,15 @@ public final class NioGatewayServer implements Runnable {
             session.send(response.toString());
         }
 
+        /** BOOK|&lt;labId&gt;|&lt;seatId&gt;|&lt;TOKEN&gt;|&lt;SIG&gt; */
         private void handleBook(ClientSession session, String[] parts) {
-            if (parts.length < 5) {
+            if (parts.length != 5) {
                 session.send("BOOK_FAIL|BAD_FRAME");
+                return;
+            }
+            TokenService.Claims claims =
+                    authorize(session, RoleGuard.Action.BOOK, parts[3], parts[4], "BOOK_FAIL");
+            if (claims == null) {
                 return;
             }
 
@@ -426,11 +500,7 @@ public final class NioGatewayServer implements Runnable {
                 return;
             }
 
-            String userId = parts[3];
-            if (userId.isBlank()) {
-                session.send("BOOK_FAIL|BAD_FRAME");
-                return;
-            }
+            String userId = claims.userId(); // from the verified token, not from the frame
 
             try {
                 workerPool.submitBooking(
@@ -468,12 +538,14 @@ public final class NioGatewayServer implements Runnable {
             }
 
             String receiptId = receipt.getReceiptId();
-            session.send("BOOK_OK|" + receiptId + "|UNSIGNED|labsync://localhost:"
+            String hash = roleGuard.tokens().signReceipt(receiptId, receipt.getLabId(),
+                    String.format("S%02d", receipt.getSeatId()), receipt.getUserId(), receipt.getTimestamp());
+            session.send("BOOK_OK|" + receiptId + "|" + hash + "|labsync://localhost:"
                     + DEFAULT_PORT + "/receipt/" + receiptId);
         }
 
-        private static boolean isKnownLab(String labId) {
-            return "LAB_A".equals(labId) || "LAB_B".equals(labId);
+        private boolean isKnownLab(String labId) {
+            return seatStore.getLabIds().contains(labId); // includes labs added with ADD_LAB
         }
 
         private static Integer parseSeatId(String seatName) {
@@ -484,7 +556,7 @@ public final class NioGatewayServer implements Runnable {
             }
             try {
                 int seatId = Integer.parseInt(seatName.substring(1));
-                return seatId >= 1 && seatId <= 20 ? seatId : null;
+                return seatId >= 1 && seatId <= SEATS_PER_LAB ? seatId : null;
             } catch (NumberFormatException e) {
                 return null;
             }
