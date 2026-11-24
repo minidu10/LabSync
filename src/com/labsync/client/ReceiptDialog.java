@@ -18,7 +18,7 @@ import javax.swing.JPanel;
 import javax.swing.JTextField;
 
 /**
- * Shows a booking receipt: receipt id, SHA-256 hash, and the unibook:// URI
+ * Shows a booking receipt: receipt id, SHA-256 hash, and the labsync:// URI
  * split into its parts with java.net.URI (via NetworkResolver).
  */
 public final class ReceiptDialog {

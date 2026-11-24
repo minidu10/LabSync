@@ -8,12 +8,12 @@ cd "$(dirname "$0")"
 mkdir -p certs
 rm -f certs/server.jks certs/truststore.jks certs/server.cer
 
-keytool -genkeypair -alias unibook -keyalg RSA -keysize 2048 -validity 365 \
-  -dname "CN=localhost, OU=UniBook, O=Group, C=LK" -ext "SAN=dns:localhost,ip:127.0.0.1" \
+keytool -genkeypair -alias labsync -keyalg RSA -keysize 2048 -validity 365 \
+  -dname "CN=localhost, OU=LabSync, O=Group, C=LK" -ext "SAN=dns:localhost,ip:127.0.0.1" \
   -keystore certs/server.jks -storepass changeit -keypass changeit
 
-keytool -exportcert -alias unibook -keystore certs/server.jks -storepass changeit -file certs/server.cer
-keytool -importcert -noprompt -alias unibook -file certs/server.cer \
+keytool -exportcert -alias labsync -keystore certs/server.jks -storepass changeit -file certs/server.cer
+keytool -importcert -noprompt -alias labsync -file certs/server.cer \
   -keystore certs/truststore.jks -storepass changeit
 rm certs/server.cer
 echo "Created dev/certs/server.jks and dev/certs/truststore.jks (password: changeit)"

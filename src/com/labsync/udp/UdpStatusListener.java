@@ -206,9 +206,16 @@ public final class UdpStatusListener implements Runnable, AutoCloseable {
         // -------------------------------------------------------------------------
         if (incomingSeq <= currentLastSeen) {
             droppedPackets.incrementAndGet();
-            log("WARN [DROP] Out-of-order / stale packet rejected: incomingSeq=%d <= lastSeenSeq=%d | Frame: \"%s\" "
-                    + "(Zombie state mitigated: UI protected from stale rollback)",
-                    incomingSeq, currentLastSeen, rawFrame);
+            if (incomingSeq == currentLastSeen) {
+                // The broadcaster sends each update to several addresses (255.255.255.255, subnet
+                // broadcast, loopback), so the same packet often arrives more than once. Harmless.
+                log("[DUP] Duplicate copy of SEQ:%d ignored (same update via another broadcast address)",
+                        incomingSeq);
+            } else {
+                log("WARN [DROP] Out-of-order / stale packet rejected: incomingSeq=%d <= lastSeenSeq=%d | Frame: \"%s\" "
+                        + "(Zombie state mitigated: UI protected from stale rollback)",
+                        incomingSeq, currentLastSeen, rawFrame);
+            }
             return;
         }
 
@@ -236,6 +243,16 @@ public final class UdpStatusListener implements Runnable, AutoCloseable {
                 }
             }
         });
+    }
+
+    /**
+     * Forgets the highest sequence number seen. A restarted gateway counts from SEQ:1 again, so a
+     * client calls this after (re)connecting - right before it reloads the full seat map with LIST -
+     * otherwise every update from the new gateway would be dropped as "stale".
+     */
+    public void resetSequence() {
+        long previous = lastSeenSeq.getAndSet(0);
+        log("Sequence window reset (lastSeenSeq %d -> 0) after (re)connecting to the gateway", previous);
     }
 
     /** Returns the highest monotonic sequence number processed so far. */

@@ -1,6 +1,7 @@
 package com.labsync.engine;
 
 import java.util.List;
+import java.util.concurrent.Callable;
 import java.util.Objects;
 import java.util.function.Consumer;
 import java.util.concurrent.CancellationException;
@@ -104,6 +105,40 @@ public final class BookingWorkerPool implements AutoCloseable {
         } catch (RejectedExecutionException exception) {
             throw new RejectedExecutionException(
                     "Booking request was rejected because the worker pool is shut down",
+                    exception);
+        }
+    }
+
+    /**
+     * Runs any seat operation (e.g. a cancellation) on the pool and delivers its result or
+     * failure through callbacks, exactly like the callback form of {@code submitBooking}.
+     *
+     * @throws RejectedExecutionException if the pool is shut down
+     */
+    public <T> Future<T> submitAsync(
+            Callable<T> work,
+            Consumer<T> onSuccess,
+            Consumer<Throwable> onFailure) {
+        Objects.requireNonNull(work, "work must not be null");
+        Objects.requireNonNull(onSuccess, "onSuccess must not be null");
+        Objects.requireNonNull(onFailure, "onFailure must not be null");
+        try {
+            return executor.submit(() -> {
+                try {
+                    T result = work.call();
+                    onSuccess.accept(result);
+                    return result;
+                } catch (Throwable throwable) {
+                    onFailure.accept(throwable);
+                    if (throwable instanceof Exception exception) {
+                        throw exception;
+                    }
+                    throw (Error) throwable;
+                }
+            });
+        } catch (RejectedExecutionException exception) {
+            throw new RejectedExecutionException(
+                    "Request was rejected because the worker pool is shut down",
                     exception);
         }
     }

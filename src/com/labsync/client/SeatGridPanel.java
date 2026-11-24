@@ -25,8 +25,9 @@ import javax.swing.plaf.basic.BasicButtonUI;
  * - setSeatStatus(...) changes one seat
  * - markMine(...)      remembers a seat this user booked (shown as YOURS)
  * - onSeatUpdate(...)  thread-safe entry point for UDP updates (Member 3)
- * - a click on a FREE seat is reported through the seat-click callback;
- *   the app decides what to do (send BOOK), keeping networking out of here.
+ * - a click on a FREE seat, or on a booked seat the user may cancel (their own,
+ *   or any seat for an ADMIN), is reported through the seat-click callback;
+ *   the app decides what to do (send BOOK or CANCEL), keeping networking out of here.
  *
  * All methods except onSeatUpdate must be called on the Swing thread (EDT).
  */
@@ -52,6 +53,7 @@ public class SeatGridPanel extends JPanel implements SeatUpdateHandler {
     private String currentUser;
     private Consumer<String> onSeatClicked = seat -> { };
     private boolean interactive = true;
+    private boolean canCancelAny;
 
     public SeatGridPanel() {
         super(new BorderLayout(10, 10));
@@ -76,7 +78,16 @@ public class SeatGridPanel extends JPanel implements SeatUpdateHandler {
 
     /** Used to recognise our own bookings in UDP updates. */
     public void setCurrentUser(String userId) {
+        if (userId == null || !userId.equals(currentUser)) {
+            mySeats.clear();                 // another user logged in: earlier seats are not theirs
+        }
         this.currentUser = userId;
+    }
+
+    /** ADMIN may cancel any booked seat; a STUDENT only their own. */
+    public void setCanCancelAny(boolean on) {
+        this.canCancelAny = on;
+        buttons.keySet().forEach(this::refreshTile);
     }
 
     public String getCurrentLab() {
@@ -170,7 +181,16 @@ public class SeatGridPanel extends JPanel implements SeatUpdateHandler {
     }
 
     private boolean isClickable(String seatId) {
-        return interactive && "FREE".equals(statuses.get(seatId));
+        return interactive && (isFree(seatId) || isCancellable(seatId));
+    }
+
+    private boolean isFree(String seatId) {
+        return "FREE".equals(statuses.get(seatId));
+    }
+
+    private boolean isCancellable(String seatId) {
+        return "BOOKED".equals(statuses.get(seatId))
+                && (canCancelAny || mySeats.contains(key(seatId)));
     }
 
     private void refreshTile(String seatId) {
@@ -196,7 +216,15 @@ public class SeatGridPanel extends JPanel implements SeatUpdateHandler {
             b.setText(text);
         }
         b.setCursor(Cursor.getPredefinedCursor(isClickable(seatId) ? Cursor.HAND_CURSOR : Cursor.DEFAULT_CURSOR));
-        b.setToolTipText(isClickable(seatId) ? "Click to book " + seatId : seatId + ": " + shown);
+        String tip;
+        if (!isClickable(seatId)) {
+            tip = seatId + ": " + shown;
+        } else if (isFree(seatId)) {
+            tip = "Click to book " + seatId;
+        } else {
+            tip = "Click to cancel the booking for " + seatId;
+        }
+        b.setToolTipText(tip);
     }
 
     private void updateSummary() {

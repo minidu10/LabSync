@@ -107,6 +107,34 @@ public final class SeatStore {
         }
     }
 
+    /** Outcome of {@link #cancelSeat(String, int, String, boolean)}. */
+    public enum CancelOutcome { CANCELLED, NOT_BOOKED, NOT_OWNER }
+
+    /**
+     * Cancels a booking. The check and the release happen inside one seat lock, so the
+     * reported reason is always consistent with the seat state at that instant.
+     *
+     * @param userId   the user asking to cancel
+     * @param override {@code true} lets the caller cancel another user's booking (ADMIN)
+     * @return CANCELLED, NOT_BOOKED (seat was free) or NOT_OWNER (booked by someone else)
+     * @throws IllegalArgumentException for an unknown lab or seat
+     */
+    public CancelOutcome cancelSeat(String labId, int seatId, String userId, boolean override) {
+        validateUserId(userId);
+        Seat seat = findSeat(labId, seatId);
+        synchronized (seat) {
+            if (!seat.booked) {
+                return CancelOutcome.NOT_BOOKED;
+            }
+            if (!override && !seat.bookedUserId.equals(userId)) {
+                return CancelOutcome.NOT_OWNER;
+            }
+            seat.booked = false;
+            seat.bookedUserId = null;
+            return CancelOutcome.CANCELLED;
+        }
+    }
+
     /**
      * Returns whether a seat is currently booked.
      *

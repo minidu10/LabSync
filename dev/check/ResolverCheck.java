@@ -16,9 +16,9 @@ public class ResolverCheck {
         }
 
         String[] uris = {
-            "unibook://localhost:5000/receipt/R-1001",
+            "labsync://localhost:5000/receipt/R-1001",
             "http://localhost:5000/receipt/R-1001",
-            "unibook://localhost:5000/other/R-1"
+            "labsync://localhost:5000/other/R-1"
         };
         for (String u : uris) {
             try {

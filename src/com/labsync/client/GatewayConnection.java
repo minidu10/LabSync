@@ -91,6 +91,11 @@ public class GatewayConnection implements Closeable {
         return Protocol.parseBook(request(Protocol.book(labId, seatId, session)));
     }
 
+    /** CANCEL|lab|seat|token|sig -> ok or failure reason. */
+    public Protocol.CancelResult cancel(String labId, String seatId, Session session) throws IOException {
+        return Protocol.parseCancel(request(Protocol.cancel(labId, seatId, session)));
+    }
+
     /** Not synchronized on purpose: it must be able to interrupt a blocked read. */
     @Override
     public void close() {
