@@ -2,6 +2,9 @@ package com.labsync.nio;
 
 import com.labsync.engine.BookingWorkerPool;
 import com.labsync.engine.SeatStore;
+import com.labsync.security.RoleGuard;
+import com.labsync.security.SharedSecret;
+import com.labsync.security.TokenService;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -24,12 +27,22 @@ public final class NioGatewayIntegrationTest {
     private static int passed;
     private static int failed;
 
+    /** Same role TlsAuthServer plays in production: mints the signed tokens BOOK frames carry. */
+    private static final TokenService TOKENS = new TokenService(
+            SharedSecret.of("integration-test-secret-0123".getBytes(StandardCharsets.UTF_8)));
+
+    /** BOOK|lab|seat|TOKEN|SIG for a STUDENT token issued to {@code userId}. */
+    private static String book(String labId, String seatId, String userId) {
+        TokenService.IssuedToken t = TOKENS.issue(userId, RoleGuard.Role.STUDENT);
+        return "BOOK|" + labId + "|" + seatId + "|" + t.token() + "|" + t.signature();
+    }
+
     public static void main(String[] args) throws Exception {
         int port = findFreePort();
         SeatStore seatStore = new SeatStore(Map.of("LAB_A", 20, "LAB_B", 20));
         BookingWorkerPool workerPool = new BookingWorkerPool(4);
         NioGatewayServer server =
-                new NioGatewayServer(port, seatStore, workerPool);
+                new NioGatewayServer(port, seatStore, workerPool, new RoleGuard(TOKENS));
 
         try {
             testServerStarts(server, port);
@@ -64,7 +77,7 @@ public final class NioGatewayIntegrationTest {
     private static void testValidBooking(NioGatewayServer server, int port)
             throws Exception {
         String response = exchange(port,
-                "BOOK|LAB_A|S03|integration-user|TOK|SIG");
+                book("LAB_A", "S03", "integration-user"));
 
         check("2. Client sends a valid booking request",
                 response != null,
@@ -72,8 +85,9 @@ public final class NioGatewayIntegrationTest {
         check("4. Successful booking returns BOOK_OK with receipt ID",
                 response.startsWith("BOOK_OK|")
                         && response.split("\\|").length >= 3
-                        && response.contains("|UNSIGNED|labsync://"),
-                "BOOK_OK|<receiptId>|UNSIGNED|labsync://...");
+                        && response.split("\\|")[2].matches("[0-9a-f]{64}")
+                        && response.contains("|labsync://"),
+                "BOOK_OK|<receiptId>|<SHA256_HASH>|labsync://...");
     }
 
     private static void testAsyncProcessing(NioGatewayServer server, int port)
@@ -87,7 +101,7 @@ public final class NioGatewayIntegrationTest {
         try {
             Future<?> bookingClient = clients.submit(() ->
                     sendWithLatch(port,
-                            "BOOK|LAB_A|S04|async-user|TOK|SIG",
+                            book("LAB_A", "S04", "async-user"),
                             ready,
                             start,
                             booking));
@@ -126,13 +140,13 @@ public final class NioGatewayIntegrationTest {
         try {
             Future<?> firstClient = clients.submit(() ->
                     sendWithLatch(port,
-                            "BOOK|LAB_A|S05|race-user-1|TOK|SIG",
+                            book("LAB_A", "S05", "race-user-1"),
                             ready,
                             start,
                             first));
             Future<?> secondClient = clients.submit(() ->
                     sendWithLatch(port,
-                            "BOOK|LAB_A|S05|race-user-2|TOK|SIG",
+                            book("LAB_A", "S05", "race-user-2"),
                             ready,
                             start,
                             second));
@@ -172,11 +186,7 @@ public final class NioGatewayIntegrationTest {
                 bookings.add(clients.submit(() -> {
                     ready.countDown();
                     start.await(5, TimeUnit.SECONDS);
-                    return exchange(port,
-                            "BOOK|LAB_A|S"
-                                    + String.format("%02d", seat)
-                                    + "|responsive-" + seat
-                                    + "|TOK|SIG");
+                    return exchange(port, book("LAB_A", String.format("S%02d", seat), "responsive-" + seat));
                 }));
             }
 
@@ -217,19 +227,19 @@ public final class NioGatewayIntegrationTest {
         try {
             Future<?> firstClient = clients.submit(() ->
                     sendWithLatch(port,
-                            "BOOK|LAB_B|S14|different-1|TOK|SIG",
+                            book("LAB_B", "S14", "different-1"),
                             ready,
                             start,
                             first));
             Future<?> secondClient = clients.submit(() ->
                     sendWithLatch(port,
-                            "BOOK|LAB_B|S15|different-2|TOK|SIG",
+                            book("LAB_B", "S15", "different-2"),
                             ready,
                             start,
                             second));
             Future<?> thirdClient = clients.submit(() ->
                     sendWithLatch(port,
-                            "BOOK|LAB_B|S16|different-3|TOK|SIG",
+                            book("LAB_B", "S16", "different-3"),
                             ready,
                             start,
                             third));
