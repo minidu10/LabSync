@@ -14,6 +14,7 @@ public final class SeatStoreTest {
         testSameSeatRejected();
         testDifferentSeatsConcurrent();
         testManyThreadsSameSeat();
+        testCancelSeat();
 
         System.out.println();
         System.out.printf("RESULT: %d PASS, %d FAIL%n", passed, failed);
@@ -115,6 +116,28 @@ public final class SeatStoreTest {
                         && store.isBooked("LAB_A", 1),
                 "successfulBookings=" + successfulBookings.get()
                         + ", seatBooked=true");
+    }
+
+    private static void testCancelSeat() {
+        SeatStore store = new SeatStore(Map.of("LAB_A", 3));
+        store.bookSeat("LAB_A", 1, "owner");
+        store.bookSeat("LAB_A", 2, "owner");
+
+        SeatStore.CancelOutcome free = store.cancelSeat("LAB_A", 3, "owner", false);
+        SeatStore.CancelOutcome stranger = store.cancelSeat("LAB_A", 1, "someone-else", false);
+        boolean stillBooked = store.isBooked("LAB_A", 1);
+        SeatStore.CancelOutcome own = store.cancelSeat("LAB_A", 1, "owner", false);
+        SeatStore.CancelOutcome admin = store.cancelSeat("LAB_A", 2, "admin", true);
+
+        check("6. Cancel: free seat NOT_BOOKED, stranger NOT_OWNER, owner and override CANCELLED",
+                free == SeatStore.CancelOutcome.NOT_BOOKED
+                        && stranger == SeatStore.CancelOutcome.NOT_OWNER
+                        && stillBooked
+                        && own == SeatStore.CancelOutcome.CANCELLED
+                        && admin == SeatStore.CancelOutcome.CANCELLED
+                        && !store.isBooked("LAB_A", 1)
+                        && !store.isBooked("LAB_A", 2),
+                "free=" + free + ", stranger=" + stranger + ", own=" + own + ", admin=" + admin);
     }
 
     private static void await(CountDownLatch latch) {
