@@ -1,6 +1,6 @@
 package check;
 
-import com.labsync.client.UniBookClientApp;
+import com.labsync.client.LabSyncClientApp;
 import java.awt.Component;
 import java.awt.Container;
 import java.awt.Graphics2D;
@@ -22,7 +22,7 @@ import javax.swing.SwingUtilities;
 public class AppSmokeCheck {
 
     public static void main(String[] args) throws Exception {
-        UniBookClientApp.main(new String[0]);
+        LabSyncClientApp.main(new String[0]);
         Thread.sleep(1500);
         for (String step : args) {
             System.out.println("step " + step);

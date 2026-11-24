@@ -104,7 +104,7 @@ public class MockGateway {
                 lab.put(p[2], "BOOKED");
                 String id = "R" + receiptCounter.incrementAndGet();
                 String hash = sha256(id + "|" + p[1] + "|" + p[2] + "|" + p[3]);
-                return "BOOK_OK|" + id + "|" + hash + "|unibook://localhost:" + port + "/receipt/" + id;
+                return "BOOK_OK|" + id + "|" + hash + "|labsync://localhost:" + port + "/receipt/" + id;
             }
             default:
                 return "ERROR|UNKNOWN_COMMAND";
